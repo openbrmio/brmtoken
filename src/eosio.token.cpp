@@ -384,6 +384,178 @@ void token::unlock_balance(name owner) {
 
 /** end of BRM stake functions **/
 
+/*** utility invoice payments */
+
+void token::sendinvoice(name from, name to, asset invoice_total, uint32_t payment_due, string descr) {
+
+    require_auth(from);
+    require_recipient(to);
+    uinvoice_table u_t(_self, from.value);
+    cinvoice_table c_t(_self, to.value);
+    eosio_assert(is_account(to), "to account does not exist");
+    auto sym = invoice_total.symbol.code();
+    stats statstable(_self, sym.raw());
+    const auto &st = statstable.get(sym.raw());
+    eosio_assert(invoice_total.is_valid(), "invalid amount");
+    eosio_assert(invoice_total.amount > 0, "invoice amount must be positive");
+    eosio_assert(invoice_total.symbol == st.supply.symbol, "symbol precision mismatch");
+    eosio_assert(payment_due <= now(), "Invalid payment due.");
+    //eosio_assert(itr == s_t.end(), "Account already has a stake. Must unstake first.");
+	
+    //uint64_t	invoice_id = u_t.available_primary_key();
+
+    uint64_t invoice_id = 0;
+    auto size = transaction_size();
+    char buf[size];
+    uint32_t read = read_transaction( buf, size );
+    eosio_assert( size == read, "read_transaction failed");
+    capi_checksum256 h;
+    sha256(buf, read, &h);
+    for(int i=0; i<4; i++) {
+      invoice_id <<=8;
+      invoice_id |= h.hash[i];
+    }
+
+    auto idx = u_t.emplace(_self, [&](auto &inv) {
+	inv.invoice_id_key = invoice_id;
+    	inv.from_account = from;
+	inv.to_account	= to;
+	inv.invoice_total = invoice_total;
+	inv.payment_due = payment_due;
+	inv.invoice_descr = descr;
+	inv.invoice_status = BRM_INVOICE_STATUS_OPEN;
+    });
+    
+	
+    c_t.emplace(_self, [&](auto &in) {
+        in.invoice_id_key = invoice_id;
+        in.created_date = now();
+	in.sender	= from;
+    });
+
+    _notify(name("sendinvoice"),  "New Invoice has been sent", *idx);
+}
+
+/***** Pay invoice **************************/
+
+void token::payinvoice(name payer, uint64_t invoice_id, asset invoice_total ) {
+
+    require_auth(payer);
+    cinvoice_table u_t(_self, payer.value);
+    eosio_assert(is_account(payer), "payer account does not exist");
+    auto sym = invoice_total.symbol.code();
+    stats statstable(_self, sym.raw());
+    const auto &st = statstable.get(sym.raw());
+    eosio_assert(invoice_total.is_valid(), "invalid amount");
+    eosio_assert(invoice_total.amount > 0, "invoice amount must be positive");
+    eosio_assert(invoice_total.symbol == st.supply.symbol, "symbol precision mismatch");
+    //eosio_assert(itr == s_t.end(), "Account already has a stake. Must unstake first.");
+
+
+    auto inv = u_t.find(invoice_id);
+    eosio_assert(inv != u_t.end(), "Account has no such invoice");
+    const auto& uidx = *inv;
+    uinvoice_table m_t(_self, uidx.sender.value);
+    //uinvoice_table m_t(_self, payer.value);
+
+    auto minv = m_t.find(invoice_id);
+    eosio_assert(minv != m_t.end(), "Invoice not found");
+
+    const auto& midx = *minv;
+    eosio_assert(midx.invoice_total == invoice_total, "Partial/Over Payments not allowed");
+
+    eosio_assert(midx.invoice_status == BRM_INVOICE_STATUS_OPEN, "Invoice is already paid/rejected");
+
+    SEND_INLINE_ACTION( *this, transfer, { {payer, "active"_n} },
+                          { payer, midx.from_account, invoice_total, "Paid" }
+    );
+
+    uint64_t payment_id = 0; 
+    auto size = transaction_size();
+    char buf[size];
+    uint32_t read = read_transaction( buf, size );
+    eosio_assert( size == read, "read_transaction failed");
+    capi_checksum256 h;
+    sha256(buf, read, &h);
+
+    for(int i=0; i<8; i++) {
+      payment_id <<=8;
+      payment_id |= h.hash[i];
+    }
+
+    m_t.modify( minv, same_payer, [&]( auto& s ) {
+       s.invoice_status = BRM_INVOICE_STATUS_PAID;
+       s.payment_date = now();
+       s.paid_total = invoice_total;
+       s.payment_id = std::to_string(payment_id);
+    });
+
+    u_t.erase(inv);
+
+    _notify(name("payinvoice"),  "Invoice has been paid", midx);
+}
+
+/***** Reject invoice **************************/
+
+void token::rejectinvoice(name payer, uint64_t invoice_id, string reason) {
+
+    require_auth(payer);
+    cinvoice_table u_t(_self, payer.value);
+    eosio_assert(is_account(payer), "payer account does not exist");
+
+    auto inv = u_t.find(invoice_id);
+    eosio_assert(inv != u_t.end(), "Account has no such invoice");
+    const auto& uidx = *inv;
+    uinvoice_table m_t(_self, uidx.sender.value);
+
+    auto minv = m_t.find(invoice_id);
+    eosio_assert(minv != m_t.end(), "Invoice not found");
+
+    const auto& midx = *minv;
+    eosio_assert(midx.invoice_status == BRM_INVOICE_STATUS_OPEN, "Invoice is already paid/rejected");
+
+    m_t.modify( minv, same_payer, [&]( auto& s ) {
+       s.invoice_status = BRM_INVOICE_STATUS_REJECTED;
+       s.invoice_descr = s.invoice_descr + "|reject:"+ reason;
+    });
+
+    u_t.erase(inv);
+
+    _notify(name("rejectinvoice"),  "Invoice has been rejected", midx);
+
+}
+
+
+
+/*** utility invoice payments */
+// inline notifications
+struct invoice_notification_abi {
+    name        invoice_status;
+    string      message;
+    uint64_t    invoice_id;
+    name        created_by;
+    string      description;
+    asset       quantity;
+    uint32_t    payment_due;
+};
+
+// leave a trace in history
+void token::_notify(name invoice_status, const string message, const utility_invoice& d)
+  {
+    action {
+      permission_level{_self, name("active")},
+      d.to_account,
+      name("notify"),
+      invoice_notification_abi {
+        .invoice_status=invoice_status,
+        .message=message,
+        .invoice_id=d.invoice_id_key, .created_by=d.from_account, .description=d.invoice_descr,
+        .quantity=d.invoice_total,
+        .payment_due=d.payment_due }
+    }.send();
+  }
+
+
 } /// namespace eosio
 
-EOSIO_DISPATCH( eosio::token, (create)(issue)(transfer)(open)(close)(retire)(stake)(unstake)(refund))
+EOSIO_DISPATCH( eosio::token, (create)(issue)(transfer)(open)(close)(retire)(stake)(unstake)(refund)(sendinvoice)(payinvoice)(rejectinvoice))
