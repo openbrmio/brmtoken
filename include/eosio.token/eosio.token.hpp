@@ -6,6 +6,10 @@
 
 #include <eosiolib/asset.hpp>
 #include <eosiolib/eosio.hpp>
+#include <eosiolib/crypto.h>
+#include <eosiolib/time.hpp>
+#include <eosiolib/transaction.hpp>
+
 
 #include <string>
 
@@ -53,6 +57,16 @@ namespace eosio {
 
 	 [[eosio::action]]
 	 void refund(const name owner);
+
+	 [[eosio::action]]
+	 void sendinvoice(name from, name to, asset invoice_total, uint32_t payment_due, string descr);
+
+	 [[eosio::action]]
+	 void payinvoice(name payer, uint64_t invoice_id, asset invoice_total);
+
+	 [[eosio::action]]
+	 void rejectinvoice(name payer, uint64_t invoice_id, string reason);
+
 
 	/* end of stake actions */
 
@@ -184,6 +198,44 @@ namespace eosio {
         }
 	
 	void unlock_balance(name owner);
+
+	/** start utility payments **/
+
+	const uint8_t   BRM_INVOICE_STATUS_OPEN = 1;
+	const uint8_t   BRM_INVOICE_STATUS_PART_PAID = 2;
+	const uint8_t   BRM_INVOICE_STATUS_PAID = 3;
+	const uint8_t   BRM_INVOICE_STATUS_REJECTED = 4;
+	const uint8_t   BRM_INVOICE_STATUS_WRITEOFF = 5;
+
+
+	//merchant invoice
+	struct [[eosio::table]] utility_invoice {
+		uint64_t	invoice_id_key;
+		uint8_t		invoice_status;
+                name            from_account;
+                name            to_account;
+                asset           invoice_total;
+                asset           paid_total;
+                uint32_t        payment_due;
+                uint32_t        payment_date;
+                string          payment_id;
+		string		invoice_descr;
+		
+                uint64_t        primary_key () const { return invoice_id_key; }
+        };
+
+	//user received invoice
+	struct [[eosio::table]] customer_invoice {
+                uint64_t        invoice_id_key;
+                uint32_t        created_date;
+		name		sender;
+                uint64_t        primary_key () const { return invoice_id_key; }
+        };
+
+        typedef multi_index<"uinvoices"_n, utility_invoice> uinvoice_table;
+        typedef multi_index<"cinvoices"_n, customer_invoice> cinvoice_table;
+
+	void _notify(name invoice_status, const string message, const utility_invoice& d);
 
 };
 
